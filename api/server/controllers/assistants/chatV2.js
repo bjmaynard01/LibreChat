@@ -40,6 +40,7 @@ const { OpenAIEmbeddings } = require('@langchain/openai');
 const { Pool } = require('pg');
 
 const getRAGContext = async (query) => {
+  throw new Error('getRAGContext() is running - forced crash for debug');
   const pool = new Pool({
     connectionString: process.env.PGVECTOR_DATABASE_URL,
   });
@@ -79,9 +80,9 @@ const chatV2 = async (req, res) => {
   const userMessageId = v4();
 
   const contextText = await getRAGContext(text);
-  logger.info('--- Injecting RAG Context into prompt ---');
-  logger.info(contextText);
-  logger.info('--- End Injected Context ---');
+  logger.error('--- Injecting RAG Context into prompt ---');
+  logger.error(contextText);
+  logger.error('--- End Injected Context ---');
 
   const userMessage = {
     role: 'user',
