@@ -40,7 +40,6 @@ const { OpenAIEmbeddings } = require('@langchain/openai');
 const { Pool } = require('pg');
 
 const getRAGContext = async (query) => {
-  throw new Error('getRAGContext() is running - forced crash for debug');
   const pool = new Pool({
     connectionString: process.env.PGVECTOR_DATABASE_URL,
   });
@@ -48,8 +47,8 @@ const getRAGContext = async (query) => {
   const store = await PGVectorStore.initialize(
     new OpenAIEmbeddings(),
     {
-      tableName: 'langchain_pg_embedding',
       collectionName: 'testcollection',
+      collectionTableName: 'langchain_pg_embedding',
       postgresConnectionOptions: pool,
     },
   );
@@ -100,4 +99,7 @@ const chatV2 = async (req, res) => {
   // ... resume original chatV2 structure from here ...
 };
 
-module.exports = chatV2;
+module.exports = {
+  chatV2,
+  getRAGContext,
+};

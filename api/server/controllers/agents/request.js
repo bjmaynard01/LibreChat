@@ -9,6 +9,9 @@ const {
 const { disposeClient, clientRegistry, requestDataMap } = require('~/server/cleanup');
 const { saveMessage } = require('~/models');
 
+const { getRAGContext } = require('~/server/controllers/assistants/chatV2') // adjust if needed
+
+
 const AgentController = async (req, res, next, initializeClient, addTitle) => {
   let {
     text,
@@ -181,7 +184,21 @@ const AgentController = async (req, res, next, initializeClient, addTitle) => {
       },
     };
 
-    let response = await client.sendMessage(text, messageOptions);
+    //let response = await client.sendMessage(text, messageOptions);
+
+    let contextText;
+try {
+  contextText = await getRAGContext(text);
+  logger.error('📎 Injected RAG Context:\n' + contextText);
+} catch (e) {
+  logger.error('❌ Error in getRAGContext:', e);
+  contextText = ''; // Fallback to original input
+}
+
+const modifiedText = `${contextText}\n\nUser: ${text}`;
+
+let response = await client.sendMessage(modifiedText, messageOptions);
+
 
     // Extract what we need and immediately break reference
     const messageId = response.messageId;

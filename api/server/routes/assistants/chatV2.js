@@ -10,7 +10,8 @@ const {
 } = require('~/server/middleware');
 const validateConvoAccess = require('~/server/middleware/validate/convoAccess');
 const validateAssistant = require('~/server/middleware/assistants/validate');
-const chatController = require('~/server/controllers/assistants/chatV2');
+//const chatController = require('~/server/controllers/assistants/chatV2');
+const { chatV2 } = require('~/server/controllers/assistants/chatV2')
 
 router.post('/abort', handleAbort());
 
@@ -29,7 +30,8 @@ router.post(
   validateAssistant,
   validateConvoAccess,
   setHeaders,
-  chatController,
+  //chatController,
+  chatV2,
 );
 
 module.exports = router;
