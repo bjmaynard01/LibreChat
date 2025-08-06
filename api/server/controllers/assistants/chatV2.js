@@ -1,4 +1,3 @@
-// Patch to enable RAG logging using LibreChat's Winston logger
 const { v4 } = require('uuid');
 const { sleep } = require('@librechat/agents');
 const { sendEvent } = require('@librechat/api');
@@ -36,38 +35,62 @@ const { getModelMaxTokens } = require('~/utils');
 const { getOpenAIClient } = require('./helpers');
 
 const { PGVectorStore } = require('@langchain/community/vectorstores/pgvector');
-const { OpenAIEmbeddings } = require('@langchain/openai');
+const { OllamaEmbeddings } = require('@langchain/community/embeddings/ollama');
 const { Pool } = require('pg');
 
+const RAG_SCORE_THRESHOLD = 0.75;
+
 const getRAGContext = async (query) => {
-  const pool = new Pool({
-    connectionString: process.env.PGVECTOR_DATABASE_URL,
-  });
+  logger.debug('Starting getRAGContext()');
+  try {
+    const store = await PGVectorStore.initialize(
+      new OllamaEmbeddings({
+        model: 'nomic-embed-text:latest',
+        baseUrl: process.env.OLLAMA_BASE_URL,
+      }),
+      {
+        collectionName: 'testcollection',
+        collectionTableName: 'langchain_pg_collection',
+        postgresConnectionOptions: {
+          connectionString: process.env.DATABASE_URL,
+          max: 2,
+          idleTimeoutMillis: 1000,
+        },
+      }
+    );
+    logger.debug('Vector store initialized');
 
-  const store = await PGVectorStore.initialize(
-    new OpenAIEmbeddings(),
-    {
-      collectionName: 'testcollection',
-      collectionTableName: 'langchain_pg_embedding',
-      postgresConnectionOptions: pool,
-    },
-  );
+    const results = await store.similaritySearchWithScore(query, 4);
 
-  const results = await store.similaritySearchWithScore(query, 4);
+    if (!results?.length) {
+      logger.info('No RAG results found.');
+      return '';
+    }
 
-  logger.info('🧠 Top 4 RAG results:');
-  results.forEach(([doc, score], i) => {
-    logger.info(`\n#${i + 1} (score: ${score.toFixed(4)})`);
-    logger.info(doc.pageContent);
-  });
+    const filtered = results.filter(([_, score]) => score >= RAG_SCORE_THRESHOLD);
 
-  return results.map(([doc]) => doc.pageContent).join('\n\n');
+    if (!filtered.length) {
+      logger.info('RAG results all below threshold — skipping context injection.');
+      return '';
+    }
+
+    logger.info(`Filtered ${filtered.length} high-confidence RAG chunks:`);
+    filtered.forEach(([doc, score], i) => {
+      logger.info(`Result #${i + 1} (score: ${score.toFixed(4)})`);
+      logger.info(`Page content:\n${doc?.pageContent || '[No content]'}`);
+    });
+
+    return filtered.map(([doc]) => doc.pageContent).join('\n\n');
+  } catch (e) {
+    logger.error(`Error in getRAGContext(): ${e?.message || e}`);
+    if (e?.stack) {
+      logger.error(e.stack);
+    }
+    return '';
+  }
 };
 
-// Main chatV2 logic
 const chatV2 = async (req, res) => {
-  // ... original structure untouched until prompt injection ...
-
   const {
     text,
     model,
@@ -77,18 +100,20 @@ const chatV2 = async (req, res) => {
   } = req.body;
 
   const userMessageId = v4();
-
   const contextText = await getRAGContext(text);
-  logger.error('--- Injecting RAG Context into prompt ---');
-  logger.error(contextText);
-  logger.error('--- End Injected Context ---');
+
+  if (contextText) {
+    logger.info('Injecting RAG context into prompt');
+  } else {
+    logger.info('No RAG context injected for this query');
+  }
 
   const userMessage = {
     role: 'user',
     content: [
       {
         type: ContentTypes.TEXT,
-        text: `${contextText}\n\nUser: ${text}`,
+        text: `${contextText ? contextText + '\n\n' : ''}User: ${text}`,
       },
     ],
     metadata: {
@@ -96,7 +121,8 @@ const chatV2 = async (req, res) => {
     },
   };
 
-  // ... resume original chatV2 structure from here ...
+  // TODO: Continue processing the message as LibreChat normally does.
+  // This file defines only RAG context injection; the rest of the logic remains unchanged.
 };
 
 module.exports = {

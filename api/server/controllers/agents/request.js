@@ -189,9 +189,15 @@ const AgentController = async (req, res, next, initializeClient, addTitle) => {
     let contextText;
 try {
   contextText = await getRAGContext(text);
-  logger.error('📎 Injected RAG Context:\n' + contextText);
+
+  if (contextText?.trim()) {
+    logger.info('Injected RAG context:');
+    logger.info(contextText);
+  } else {
+    logger.info('No RAG context injected for this query.');
+  }
 } catch (e) {
-  logger.error('❌ Error in getRAGContext:', e);
+  logger.error('Error in getRAGContext:', e);
   contextText = ''; // Fallback to original input
 }
 
