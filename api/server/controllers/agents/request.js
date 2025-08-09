@@ -9,8 +9,7 @@ const {
 const { disposeClient, clientRegistry, requestDataMap } = require('~/server/cleanup');
 const { saveMessage } = require('~/models');
 
-const { getRAGContext } = require('~/server/controllers/assistants/chatV2') // adjust if needed
-
+const { getRAGContext } = require('~/server/controllers/assistants/chatV2');
 
 const AgentController = async (req, res, next, initializeClient, addTitle) => {
   let {
@@ -25,72 +24,47 @@ const AgentController = async (req, res, next, initializeClient, addTitle) => {
     responseMessageId: editedResponseMessageId = null,
   } = req.body;
 
-  let sender;
-  let abortKey;
-  let userMessage;
-  let promptTokens;
-  let userMessageId;
-  let responseMessageId;
-  let userMessagePromise;
-  let getAbortData;
-  let client = null;
-  // Initialize as an array
-  let cleanupHandlers = [];
-
-  const newConvo = !conversationId;
   const userId = req.user.id;
+  const newConvo = !conversationId;
 
-  // Create handler to avoid capturing the entire parent scope
-  let getReqData = (data = {}) => {
-    for (let key in data) {
-      if (key === 'userMessage') {
-        userMessage = data[key];
-        userMessageId = data[key].messageId;
-      } else if (key === 'userMessagePromise') {
-        userMessagePromise = data[key];
-      } else if (key === 'responseMessageId') {
-        responseMessageId = data[key];
-      } else if (key === 'promptTokens') {
-        promptTokens = data[key];
-      } else if (key === 'sender') {
-        sender = data[key];
-      } else if (key === 'abortKey') {
-        abortKey = data[key];
-      } else if (!conversationId && key === 'conversationId') {
-        conversationId = data[key];
-      }
+  let sender,
+    abortKey,
+    userMessage,
+    userMessageId,
+    userMessagePromise,
+    promptTokens,
+    responseMessageId,
+    client = null,
+    getReqData,
+    getAbortData,
+    cleanupHandlers = [];
+
+  getReqData = (data = {}) => {
+    if ('userMessage' in data) {
+      userMessage = data.userMessage;
+      userMessageId = data.userMessage.messageId;
     }
+    if ('userMessagePromise' in data) userMessagePromise = data.userMessagePromise;
+    if ('responseMessageId' in data) responseMessageId = data.responseMessageId;
+    if ('promptTokens' in data) promptTokens = data.promptTokens;
+    if ('sender' in data) sender = data.sender;
+    if (!conversationId && 'conversationId' in data) conversationId = data.conversationId;
   };
 
-  // Create a function to handle final cleanup
   const performCleanup = () => {
     logger.debug('[AgentController] Performing cleanup');
-    // Make sure cleanupHandlers is an array before iterating
     if (Array.isArray(cleanupHandlers)) {
-      // Execute all cleanup handlers
       for (const handler of cleanupHandlers) {
         try {
-          if (typeof handler === 'function') {
-            handler();
-          }
+          if (typeof handler === 'function') handler();
         } catch (e) {
-          logger.error('[AgentController] Error in cleanup handler', e);
+          logger.error('[AgentController] Cleanup handler error', e);
         }
       }
     }
+    if (abortKey) cleanupAbortController(abortKey);
+    if (client) disposeClient(client);
 
-    // Clean up abort controller
-    if (abortKey) {
-      logger.debug('[AgentController] Cleaning up abort controller');
-      cleanupAbortController(abortKey);
-    }
-
-    // Dispose client properly
-    if (client) {
-      disposeClient(client);
-    }
-
-    // Clear all references
     client = null;
     getReqData = null;
     userMessage = null;
@@ -100,71 +74,40 @@ const AgentController = async (req, res, next, initializeClient, addTitle) => {
     cleanupHandlers = null;
     userMessagePromise = null;
 
-    // Clear request data map
-    if (requestDataMap.has(req)) {
-      requestDataMap.delete(req);
-    }
-    logger.debug('[AgentController] Cleanup completed');
+    if (requestDataMap.has(req)) requestDataMap.delete(req);
+    logger.debug('[AgentController] Cleanup complete');
   };
 
   try {
-    /** @type {{ client: TAgentClient }} */
     const result = await initializeClient({ req, res, endpointOption });
     client = result.client;
 
-    // Register client with finalization registry if available
-    if (clientRegistry) {
-      clientRegistry.register(client, { userId }, client);
-    }
-
-    // Store request data in WeakMap keyed by req object
+    if (clientRegistry) clientRegistry.register(client, { userId }, client);
     requestDataMap.set(req, { client });
 
-    // Use WeakRef to allow GC but still access content if it exists
     const contentRef = new WeakRef(client.contentParts || []);
-
-    // Minimize closure scope - only capture small primitives and WeakRef
-    getAbortData = () => {
-      // Dereference WeakRef each time
-      const content = contentRef.deref();
-
-      return {
-        sender,
-        content: content || [],
-        userMessage,
-        promptTokens,
-        conversationId,
-        userMessagePromise,
-        messageId: responseMessageId,
-        parentMessageId: overrideParentMessageId ?? userMessageId,
-      };
-    };
+    getAbortData = () => ({
+      sender,
+      content: contentRef.deref() || [],
+      userMessage,
+      promptTokens,
+      conversationId,
+      userMessagePromise,
+      messageId: responseMessageId,
+      parentMessageId: overrideParentMessageId ?? userMessageId,
+    });
 
     const { abortController, onStart } = createAbortController(req, res, getAbortData, getReqData);
 
-    // Simple handler to avoid capturing scope
     const closeHandler = () => {
-      logger.debug('[AgentController] Request closed');
-      if (!abortController) {
-        return;
-      } else if (abortController.signal.aborted) {
-        return;
-      } else if (abortController.requestCompleted) {
-        return;
+      if (!abortController?.signal?.aborted && !abortController?.requestCompleted) {
+        abortController.abort();
+        logger.debug('[AgentController] Request aborted on close');
       }
-
-      abortController.abort();
-      logger.debug('[AgentController] Request aborted on close');
     };
 
     res.on('close', closeHandler);
-    cleanupHandlers.push(() => {
-      try {
-        res.removeListener('close', closeHandler);
-      } catch (e) {
-        logger.error('[AgentController] Error removing close listener', e);
-      }
-    });
+    cleanupHandlers.push(() => res.removeListener('close', closeHandler));
 
     const messageOptions = {
       user: userId,
@@ -179,126 +122,112 @@ const AgentController = async (req, res, next, initializeClient, addTitle) => {
       overrideParentMessageId,
       isEdited: !!editedContent,
       responseMessageId: editedResponseMessageId,
-      progressOptions: {
-        res,
-      },
+      progressOptions: { res },
     };
 
-    //let response = await client.sendMessage(text, messageOptions);
+    // 👇 Inject context ONLY into model's prompt
+    let contextText = '';
+    try {
+      contextText = await getRAGContext(text);
+      if (contextText) logger.info(`🧩 Injected RAG context:\n${contextText.slice(0, 1000)}...`);
+      else logger.info('📭 No RAG context injected');
+    } catch (e) {
+      logger.error('❌ Error getting RAG context:', e);
+    }
 
-    let contextText;
-try {
-  contextText = await getRAGContext(text);
+    /*const modifiedText = contextText
+      ? `Use the following context to answer the user’s question. If the context is insufficient, say so.\n\n${contextText}\n\nQuestion: ${text}`
+      : text;
 
-  if (contextText?.trim()) {
-    logger.info('Injected RAG context:');
-    logger.info(contextText);
-  } else {
-    logger.info('No RAG context injected for this query.');
-  }
-} catch (e) {
-  logger.error('Error in getRAGContext:', e);
-  contextText = ''; // Fallback to original input
-}
+    const response = await client.sendMessage(modifiedText, messageOptions);*/
+    // NEW WAY — inject context as system instruction
+    const promptPrefix = contextText
+      ? `Use the following context to answer the user’s question. If the context is insufficient, say so.\n\n${contextText}`
+      : undefined;
+      
+    const response = await client.sendMessage(text, {
+      ...messageOptions,
+      promptPrefix,
+    });
 
-const modifiedText = `${contextText}\n\nUser: ${text}`;
-
-let response = await client.sendMessage(modifiedText, messageOptions);
-
-
-    // Extract what we need and immediately break reference
     const messageId = response.messageId;
     const endpoint = endpointOption.endpoint;
     response.endpoint = endpoint;
 
-    // Store database promise locally
     const databasePromise = response.databasePromise;
     delete response.databasePromise;
 
-    // Resolve database-related data
     const { conversation: convoData = {} } = await databasePromise;
     const conversation = { ...convoData };
     conversation.title =
       conversation && !conversation.title ? null : conversation?.title || 'New Chat';
 
-    // Process files if needed
+    // --- Save user-visible message with clean user text
+    const visibleUserMessage = {
+      role: 'user',
+      content: [{ type: 'text', text }],
+      user: userId,
+      messageId: userMessageId,
+      parentMessageId,
+      conversationId,
+      metadata: {
+        contextInjected: !!contextText,
+      },
+    };
+    userMessage = visibleUserMessage;
+
+    // Attach files if needed
     if (req.body.files && client.options?.attachments) {
-      userMessage.files = [];
-      const messageFiles = new Set(req.body.files.map((file) => file.file_id));
-      for (let attachment of client.options.attachments) {
-        if (messageFiles.has(attachment.file_id)) {
-          userMessage.files.push({ ...attachment });
-        }
+      visibleUserMessage.files = [];
+      const fileIds = new Set(req.body.files.map((file) => file.file_id));
+      for (const att of client.options.attachments) {
+        if (fileIds.has(att.file_id)) visibleUserMessage.files.push({ ...att });
       }
-      delete userMessage.image_urls;
     }
 
-    // Only send if not aborted
+    // Send streaming response
     if (!abortController.signal.aborted) {
-      // Create a new response object with minimal copies
-      const finalResponse = { ...response };
-
       sendEvent(res, {
         final: true,
         conversation,
         title: conversation.title,
-        requestMessage: userMessage,
-        responseMessage: finalResponse,
+        requestMessage: visibleUserMessage,
+        responseMessage: { ...response },
       });
       res.end();
 
-      // Save the message if needed
       if (client.savedMessageIds && !client.savedMessageIds.has(messageId)) {
         await saveMessage(
           req,
-          { ...finalResponse, user: userId },
-          { context: 'api/server/controllers/agents/request.js - response end' },
+          { ...response, user: userId },
+          { context: 'AgentController: response end' },
         );
       }
     }
 
-    // Save user message if needed
     if (!client.skipSaveUserMessage) {
-      await saveMessage(req, userMessage, {
-        context: "api/server/controllers/agents/request.js - don't skip saving user message",
+      await saveMessage(req, visibleUserMessage, {
+        context: 'AgentController: saving user message',
       });
     }
 
-    // Add title if needed - extract minimal data
     if (addTitle && parentMessageId === Constants.NO_PARENT && newConvo) {
-      addTitle(req, {
-        text,
-        response: { ...response },
-        client,
-      })
-        .then(() => {
-          logger.debug('[AgentController] Title generation started');
-        })
-        .catch((err) => {
-          logger.error('[AgentController] Error in title generation', err);
-        })
-        .finally(() => {
-          logger.debug('[AgentController] Title generation completed');
-          performCleanup();
-        });
+      addTitle(req, { text, response: { ...response }, client })
+        .catch((err) => logger.error('AgentController: title error', err))
+        .finally(performCleanup);
     } else {
       performCleanup();
     }
-  } catch (error) {
-    // Handle error without capturing much scope
-    handleAbortError(res, req, error, {
+  } catch (err) {
+    handleAbortError(res, req, err, {
       conversationId,
       sender,
       messageId: responseMessageId,
       parentMessageId: overrideParentMessageId ?? userMessageId ?? parentMessageId,
       userMessageId,
     })
-      .catch((err) => {
-        logger.error('[api/server/controllers/agents/request] Error in `handleAbortError`', err);
-      })
-      .finally(() => {
-        performCleanup();
-      });
+      .catch((err2) => logger.error('AgentController: abort error', err2))
+      .finally(performCleanup);
   }
 };
 
