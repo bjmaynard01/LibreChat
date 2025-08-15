@@ -67,11 +67,294 @@ const getRAGContext = async (query) => {
     const context = kept.map(([doc]) => doc.pageContent).join('\n\n');
     logger.info(`🧩 Final injected RAG context:\n${context.slice(0, 3000)}...`);
 
-    return context;
-  } catch (e) {
-    logger.error(`❗️Error in getRAGContext(): ${e?.message || e}`);
-    if (e?.stack) logger.error(e.stack);
-    return '';
+    const getRequestFileIds = async () => {
+      let thread_file_ids = [];
+      if (convoId) {
+        const convo = await getConvo(req.user.id, convoId);
+        if (convo && convo.file_ids) {
+          thread_file_ids = convo.file_ids;
+        }
+      }
+
+      if (files.length || thread_file_ids.length) {
+        attachedFileIds = new Set([...file_ids, ...thread_file_ids]);
+
+        let attachmentIndex = 0;
+        for (const file of files) {
+          file_ids.push(file.file_id);
+          if (file.type.startsWith('image')) {
+            userMessage.content.push({
+              type: ContentTypes.IMAGE_FILE,
+              [ContentTypes.IMAGE_FILE]: { file_id: file.file_id },
+            });
+          }
+
+          if (!userMessage.attachments) {
+            userMessage.attachments = [];
+          }
+
+          userMessage.attachments.push({
+            file_id: file.file_id,
+            tools: [{ type: ToolCallTypes.CODE_INTERPRETER }],
+          });
+
+          if (file.type.startsWith('image')) {
+            continue;
+          }
+
+          const mimeType = file.type;
+          const isSupportedByRetrieval = retrievalMimeTypes.some((regex) => regex.test(mimeType));
+          if (isSupportedByRetrieval) {
+            userMessage.attachments[attachmentIndex].tools.push({
+              type: ToolCallTypes.FILE_SEARCH,
+            });
+          }
+
+          attachmentIndex++;
+        }
+      }
+    };
+
+    /** @type {Promise<Run>|undefined} */
+    let userMessagePromise;
+
+    const initializeThread = async () => {
+      await getRequestFileIds();
+
+      // TODO: may allow multiple messages to be created beforehand in a future update
+      const initThreadBody = {
+        messages: [userMessage],
+        metadata: {
+          user: req.user.id,
+          conversationId,
+        },
+      };
+
+      const result = await initThread({ openai, body: initThreadBody, thread_id });
+      thread_id = result.thread_id;
+
+      createOnTextProgress({
+        openai,
+        conversationId,
+        userMessageId,
+        messageId: responseMessageId,
+        thread_id,
+      });
+
+      requestMessage = {
+        user: req.user.id,
+        text,
+        messageId: userMessageId,
+        parentMessageId,
+        // TODO: make sure client sends correct format for `files`, use zod
+        files,
+        file_ids,
+        conversationId,
+        isCreatedByUser: true,
+        assistant_id,
+        thread_id,
+        model: assistant_id,
+        endpoint,
+      };
+
+      previousMessages.push(requestMessage);
+
+      /* asynchronous */
+      userMessagePromise = saveUserMessage(req, { ...requestMessage, model });
+
+      conversation = {
+        conversationId,
+        endpoint,
+        promptPrefix: promptPrefix,
+        instructions: instructions,
+        assistant_id,
+        // model,
+      };
+
+      if (file_ids.length) {
+        conversation.file_ids = file_ids;
+      }
+    };
+
+    const promises = [initializeThread(), checkBalanceBeforeRun()];
+    await Promise.all(promises);
+
+    const sendInitialResponse = () => {
+      sendEvent(res, {
+        sync: true,
+        conversationId,
+        // messages: previousMessages,
+        requestMessage,
+        responseMessage: {
+          user: req.user.id,
+          messageId: openai.responseMessage.messageId,
+          parentMessageId: userMessageId,
+          conversationId,
+          assistant_id,
+          thread_id,
+          model: assistant_id,
+        },
+      });
+    };
+
+    /** @type {RunResponse | typeof StreamRunManager | undefined} */
+    let response;
+
+    const processRun = async (retry = false) => {
+      if (endpoint === EModelEndpoint.azureAssistants) {
+        body.model = openai._options.model;
+        openai.attachedFileIds = attachedFileIds;
+        if (retry) {
+          response = await runAssistant({
+            openai,
+            thread_id,
+            run_id,
+            in_progress: openai.in_progress,
+          });
+          return;
+        }
+
+        /* NOTE:
+         * By default, a Run will use the model and tools configuration specified in Assistant object,
+         * but you can override most of these when creating the Run for added flexibility:
+         */
+        const run = await createRun({
+          openai,
+          thread_id,
+          body,
+        });
+
+        run_id = run.id;
+        await cache.set(cacheKey, `${thread_id}:${run_id}`, Time.TEN_MINUTES);
+        sendInitialResponse();
+
+        // todo: retry logic
+        response = await runAssistant({ openai, thread_id, run_id });
+        return;
+      }
+
+      /** @type {{[AssistantStreamEvents.ThreadRunCreated]: (event: ThreadRunCreated) => Promise<void>}} */
+      const handlers = {
+        [AssistantStreamEvents.ThreadRunCreated]: async (event) => {
+          await cache.set(cacheKey, `${thread_id}:${event.data.id}`, Time.TEN_MINUTES);
+          run_id = event.data.id;
+          sendInitialResponse();
+        },
+      };
+
+      /** @type {undefined | TAssistantEndpoint} */
+      const config = req.app.locals[endpoint] ?? {};
+      /** @type {undefined | TBaseEndpoint} */
+      const allConfig = req.app.locals.all;
+
+      const streamRunManager = new StreamRunManager({
+        req,
+        res,
+        openai,
+        handlers,
+        thread_id,
+        attachedFileIds,
+        parentMessageId: userMessageId,
+        responseMessage: openai.responseMessage,
+        streamRate: allConfig?.streamRate ?? config.streamRate,
+        // streamOptions: {
+
+        // },
+      });
+
+      await streamRunManager.runAssistant({
+        thread_id,
+        body,
+      });
+
+      response = streamRunManager;
+      response.text = streamRunManager.intermediateText;
+    };
+
+    await processRun();
+    logger.debug('[/assistants/chat/] response', {
+      run: response.run,
+      steps: response.steps,
+    });
+
+    if (response.run.status === RunStatus.CANCELLED) {
+      logger.debug('[/assistants/chat/] Run cancelled, handled by `abortRun`');
+      return res.end();
+    }
+
+    if (response.run.status === RunStatus.IN_PROGRESS) {
+      processRun(true);
+    }
+
+    completedRun = response.run;
+
+    /** @type {ResponseMessage} */
+    const responseMessage = {
+      ...(response.responseMessage ?? response.finalMessage),
+      text: response.text,
+      parentMessageId: userMessageId,
+      conversationId,
+      user: req.user.id,
+      assistant_id,
+      thread_id,
+      model: assistant_id,
+      endpoint,
+      spec: endpointOption.spec,
+      iconURL: endpointOption.iconURL,
+    };
+
+    sendEvent(res, {
+      final: true,
+      conversation,
+      requestMessage: {
+        parentMessageId,
+        thread_id,
+      },
+    });
+    res.end();
+
+    if (userMessagePromise) {
+      await userMessagePromise;
+    }
+    await saveAssistantMessage(req, { ...responseMessage, model });
+
+    if (parentMessageId === Constants.NO_PARENT && !_thread_id) {
+      addTitle(req, {
+        text,
+        responseText: response.text,
+        conversationId,
+        client,
+      });
+    }
+
+    await addThreadMetadata({
+      openai,
+      thread_id,
+      messageId: responseMessage.messageId,
+      messages: response.messages,
+    });
+
+    if (!response.run.usage) {
+      await sleep(3000);
+      completedRun = await openai.beta.threads.runs.retrieve(response.run.id, { thread_id });
+      if (completedRun.usage) {
+        await recordUsage({
+          ...completedRun.usage,
+          user: req.user.id,
+          model: completedRun.model ?? model,
+          conversationId,
+        });
+      }
+    } else {
+      await recordUsage({
+        ...response.run.usage,
+        user: req.user.id,
+        model: response.run.model ?? model,
+        conversationId,
+      });
+    }
+  } catch (error) {
+    await handleError(error);
   }
 };
 
