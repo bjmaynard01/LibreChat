@@ -138,3 +138,10 @@ helm/**/.values.yaml
 /.tabnine/
 /.codeium
 *.local.md
+
+
+# My local files
+.env
+librechat.yaml
+docker-compose.override.yml
+.bak
